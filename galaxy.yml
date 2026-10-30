@@ -56,3 +56,6 @@ build_ignore:
   - requirements.txt
   - ansible.cfg
   - "*.tar.gz"
+  - version.txt
+  - release-please-config.json
+  - .release-please-manifest.json

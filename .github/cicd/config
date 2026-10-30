@@ -2,7 +2,12 @@
 # https://github.com/omerfsen/cicd. Plain KEY=value lines, read by the
 # workflows from main (so a PR cannot change them for itself).
 
-PIPELINES=pr-title ansible-galaxy
+PIPELINES=release-please pr-title ansible-galaxy
+
+RELEASE_PLEASE_ENABLED=true
+RELEASE_PLEASE_RUNNER=ubuntu-24.04
+# release-please: files it writes the version to (space-separated)
+VERSION_FILES=version.txt galaxy.yml
 
 PR_TITLE_ENABLED=true
 PR_TITLE_RUNNER=ubuntu-24.04
