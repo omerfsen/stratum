@@ -1,0 +1,135 @@
+---
+# Join this node to the cluster. The bootstrap control plane mints a
+# short-lived token; `token create` prints the exact join command on one line,
+# which is used as printed (it carries --pod-cidr etc. when the cluster is not
+# on defaults), with the token swapped for --token-file so it never appears in
+# `ps`. Control planes also get the certificate key that decrypts the shared CA
+# material. The local copies are removed right after the start; the token is
+# revoked and the key removed once the node is Ready (join_cleanup.yml).
+
+# A key file an interrupted run left behind on the bootstrap control plane.
+# Only keys older than a join token's lifetime: any token they belong to has
+# expired, and a key someone just minted by hand is left alone.
+- name: Remove stale certificate keys from the bootstrap control plane
+  ansible.builtin.shell: |
+    set -euo pipefail
+    find /tmp -maxdepth 1 -name 'stratum-ha-certificate-key-*' -type f \
+      -mmin +{{ stratum_join_token_ttl | regex_replace('m$', '') }} -print -delete
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ stratum_bootstrap_host }}"
+  register: stratum_stale_keys
+  changed_when: stratum_stale_keys.stdout | length > 0
+  when: stratum_node_role == 'control_plane'
+
+# One at a time: concurrent `token create` calls on the same control plane
+# fail when workers join in parallel. Only stdout carries the token, so the
+# reason for a failure (stderr) is shown, the rest stays hidden.
+- name: Mint a join token on the bootstrap control plane
+  ansible.builtin.command: >-
+    {{ stratum_bin_path }} token create --ttl {{ stratum_join_token_ttl }}
+    {{ '--control-plane' if stratum_node_role == 'control_plane' else '' }}
+  delegate_to: "{{ stratum_bootstrap_host }}"
+  throttle: 1
+  register: stratum_token_out
+  # Minting takes the cluster maintenance fence; wait while another run
+  # (upgrade, CA rotation, a control-plane join) holds it.
+  until: stratum_token_out.rc == 0 or 'held by another run' not in stratum_token_out.stderr
+  retries: 30
+  delay: 10
+  changed_when: stratum_token_out.rc == 0
+  failed_when: false
+  no_log: true
+
+- name: Token creation must succeed
+  ansible.builtin.fail:
+    msg: "`stratum token create` failed on {{ stratum_bootstrap_host }}: {{ stratum_token_out.stderr | default('') }}"
+  when: stratum_token_out.rc != 0
+
+# The join line is printed on one line; only the certificate key path is
+# shell-quoted ('...'). Split it, drop those quotes, and build the arguments
+# with the token and key replaced by the local files.
+- name: Parse the join command
+  ansible.builtin.set_fact:
+    stratum_join_args: "{{ stratum_join_split }}"
+    stratum_join_token: "{{ stratum_join_split[stratum_join_split.index('--token') + 1] if '--token' in stratum_join_split else '' }}"
+    stratum_join_key_src: >-
+      {{ stratum_join_split[stratum_join_split.index('--certificate-key-file') + 1]
+         if '--certificate-key-file' in stratum_join_split else '' }}
+    stratum_join_up_args: >-
+      {%- set out = [] -%}
+      {%- for x in stratum_join_split[1:] -%}
+      {%-   set prev = stratum_join_split[loop.index0] -%}
+      {%-   if x == '--token' -%}{%- set _ = out.append('--token-file') -%}
+      {%-   elif prev == '--token' -%}{%- set _ = out.append('/root/.stratum-join/token') -%}
+      {%-   elif prev == '--certificate-key-file' -%}{%- set _ = out.append('/root/.stratum-join/certificate-key') -%}
+      {%-   else -%}{%- set _ = out.append(x) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ out | map('quote') | join(' ') }}
+  vars:
+    stratum_join_line: >-
+      {{ stratum_token_out.stdout_lines | select('search', '^\s*stratum up (--join|--worker) ') | first | default('') }}
+    stratum_join_split: >-
+      {{ stratum_join_line | trim | split | map('regex_replace', "^'(.*)'$", '\1') | list }}
+  no_log: true
+
+- name: The join command must be there
+  ansible.builtin.assert:
+    that:
+      - stratum_join_args[:2] in [['stratum', 'up']]
+      - stratum_join_token | length > 0
+      - "'--discovery-token-ca-cert-hash' in stratum_join_args"
+      - stratum_node_role == 'worker' or stratum_join_key_src | length > 0
+    fail_msg: "`stratum token create` on {{ stratum_bootstrap_host }} printed no usable join command."
+    quiet: true
+
+- name: Join with the token (and key) as files
+  block:
+    - name: Private directory for the join material
+      ansible.builtin.file:
+        path: /root/.stratum-join
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Write the token
+      ansible.builtin.copy:
+        dest: /root/.stratum-join/token
+        content: "{{ stratum_join_token }}"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Fetch the certificate key from the bootstrap control plane
+      ansible.builtin.slurp:
+        src: "{{ stratum_join_key_src }}"
+      delegate_to: "{{ stratum_bootstrap_host }}"
+      register: stratum_cert_key
+      no_log: true
+      when: stratum_node_role == 'control_plane'
+
+    - name: Write the certificate key
+      ansible.builtin.copy:
+        dest: /root/.stratum-join/certificate-key
+        content: "{{ stratum_cert_key.content | b64decode }}"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      when: stratum_node_role == 'control_plane'
+
+    - name: Join the cluster
+      ansible.builtin.include_tasks: up.yml
+      vars:
+        stratum_up_args: "{{ stratum_join_up_args }}"
+
+  always:
+    # The token and key are revoked and removed once the node is Ready
+    # (join_cleanup.yml, from node.yml); only the local copies go here.
+    - name: Remove the join material from this node
+      ansible.builtin.file:
+        path: /root/.stratum-join
+        state: absent

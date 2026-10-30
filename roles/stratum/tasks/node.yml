@@ -1,0 +1,208 @@
+---
+# One Stratum node. The first host of the control-plane group bootstraps the
+# cluster, the other control planes join through the VIP one at a time, the
+# workers join after them (playbooks/cluster.yml sets the order).
+
+- name: Gather the facts this entry point needs
+  ansible.builtin.setup:
+    gather_subset: [min, network]
+  when: ansible_facts['hostname'] is not defined
+
+- name: Work out this node's role
+  ansible.builtin.set_fact:
+    stratum_node_role: "{{ 'control_plane' if inventory_hostname in groups[stratum_control_plane_group] else 'worker' }}"
+    stratum_bootstrap_host: "{{ groups[stratum_control_plane_group][0] }}"
+    # Stratum names the node after the short hostname (cut at the first dot).
+    stratum_node_name: "{{ ansible_facts['hostname'] }}"
+    stratum_first_up_log: /var/log/stratum-first-up.log
+    stratum_first_up_pidfile: /run/stratum-first-up.pid
+
+# Stratum names Nodes, etcd members and the operator's node-name claims after
+# the short hostname: two hosts with the same one would block each other's
+# certificate approval with no error.
+- name: Hostnames are unique across the cluster
+  ansible.builtin.assert:
+    that: stratum_all_hostnames | unique | length == stratum_all_hostnames | length
+    fail_msg: "Short hostnames must be unique across the cluster: {{ stratum_all_hostnames | sort | join(', ') }}"
+    quiet: true
+  vars:
+    stratum_all_hostnames: >-
+      {{ (groups[stratum_control_plane_group] + groups[stratum_worker_group] | default([]))
+         | map('extract', hostvars, ['ansible_facts', 'hostname']) | select('defined') | list }}
+  run_once: true
+
+- name: Check the topology
+  ansible.builtin.assert:
+    that:
+      - groups[stratum_control_plane_group] | length is odd
+      - groups[stratum_control_plane_group] | length == 1 or stratum_vip | length > 0
+      - stratum_node_ip | length > 0
+    fail_msg: >-
+      Use an odd number of control planes (etcd quorum), set stratum_vip when
+      there is more than one, and make sure stratum_node_ip is known.
+    quiet: true
+
+- name: Configuration directory
+  ansible.builtin.file:
+    path: /etc/stratum
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write /etc/stratum/config.yaml
+  ansible.builtin.template:
+    src: config.yaml.j2
+    dest: /etc/stratum/config.yaml
+    owner: root
+    group: root
+    mode: "0600"
+  register: stratum_config
+
+# A node is in the cluster once Stratum's saved state exists AND it can start
+# again from it: a worker needs the client certificate of its TLS bootstrap
+# (pki/kubelet/kubelet-client-current.pem; node.yaml is written before the
+# bootstrap, and kubelet.kubeconfig at its start, before the certificate), a control
+# plane its local etcd WAL (a restart refuses without it). A join journal
+# (join-intent.json) beside a complete state is harmless.
+- name: Read this node's Stratum state
+  ansible.builtin.shell: |
+    set -u
+    state=no; [ -e /var/lib/stratum/config/node.yaml ] && state=yes
+    {% if stratum_node_role == 'worker' %}
+    ready=no; [ -s /var/lib/stratum/pki/kubelet/kubelet-client-current.pem ] && ready=yes
+    {% else %}
+    ready=no; [ -n "$(ls -A /var/lib/stratum/etcd/member/wal 2>/dev/null)" ] && ready=yes
+    {% endif %}
+    echo "$state $ready"
+  args:
+    executable: /bin/bash
+  register: stratum_node_files
+  changed_when: false
+  check_mode: false
+
+# An interrupted earlier run can leave a first `stratum up` running. Let it
+# finish before deciding anything: starting a second one beside it fails on
+# Stratum's data lock, and stopping it early is what breaks a join.
+- name: Find a stratum up left by an earlier run
+  ansible.builtin.include_tasks: foreground.yml
+  when: stratum_node_files.stdout != 'yes yes'
+
+- name: Let it finish its bootstrap or join
+  ansible.builtin.include_tasks: ready.yml
+  vars:
+    stratum_wait_pids: "{{ stratum_foreground_pids }}"
+  when:
+    - stratum_node_files.stdout != 'yes yes'
+    - stratum_foreground_pids | default([]) | length > 0
+
+- name: Read this node's Stratum state again
+  ansible.builtin.shell: |
+    set -u
+    state=no; [ -e /var/lib/stratum/config/node.yaml ] && state=yes
+    {% if stratum_node_role == 'worker' %}
+    ready=no; [ -s /var/lib/stratum/pki/kubelet/kubelet-client-current.pem ] && ready=yes
+    {% else %}
+    ready=no; [ -n "$(ls -A /var/lib/stratum/etcd/member/wal 2>/dev/null)" ] && ready=yes
+    {% endif %}
+    echo "$state $ready"
+  args:
+    executable: /bin/bash
+  register: stratum_node_files_after
+  changed_when: false
+  check_mode: false
+  when: stratum_foreground_pids | default([]) | length > 0
+
+- name: Settle this node's Stratum state
+  ansible.builtin.set_fact:
+    stratum_node_files_state: >-
+      {{ stratum_node_files_after.stdout if stratum_node_files_after is not skipped
+         else stratum_node_files.stdout }}
+
+# Saved state without the rest and nothing running: a join that died after
+# Stratum saved its state. Starting it would never finish (its token is gone),
+# so stop and say how to start the node again.
+- name: A half-joined node needs a clean start
+  ansible.builtin.assert:
+    that: stratum_node_files_state != 'yes no'
+    fail_msg: >-
+      {{ inventory_hostname }} has Stratum state (/var/lib/stratum/config/node.yaml) but never
+      finished joining. Run `sudo /usr/local/bin/stratum uninstall --yes` on it (for a control
+      plane first `stratum etcdctl member remove` its member from a healthy one; for a worker see
+      "Reusing a node name" in Stratum's configuration docs), then rerun the playbook.
+    quiet: true
+
+- name: Read the service states
+  ansible.builtin.service_facts:
+
+- name: Record this node's state
+  ansible.builtin.set_fact:
+    stratum_member: "{{ stratum_node_files_state == 'yes yes' }}"
+    stratum_service_active: "{{ ansible_facts['services']['stratum.service']['state'] | default('') == 'running' }}"
+
+- name: Config changed on a running node
+  ansible.builtin.debug:
+    msg: >-
+      /etc/stratum/config.yaml changed on a running node; it takes effect on the
+      next `systemctl restart stratum`. Not restarted automatically.
+  when: stratum_config is changed and stratum_service_active | bool
+
+- name: Bring the node up
+  when: not ansible_check_mode
+  block:
+    - name: Bootstrap the first control plane
+      ansible.builtin.include_tasks: bootstrap.yml
+      when:
+        - not stratum_member | bool
+        - inventory_hostname == stratum_bootstrap_host
+
+    - name: Join
+      ansible.builtin.include_tasks: join.yml
+      when:
+        - not stratum_member | bool
+        - inventory_hostname != stratum_bootstrap_host
+
+    - name: Run under stratum.service
+      ansible.builtin.include_tasks: handover.yml
+
+    - name: Wait until the node serves
+      ansible.builtin.include_tasks: wait.yml
+
+  # The join token stays valid until the node is registered and Ready: a
+  # worker's kubelet uses it for its TLS bootstrap after `started kubelet`.
+  always:
+    - name: Revoke the join token and remove the certificate key
+      ansible.builtin.include_tasks: join_cleanup.yml
+      when: stratum_join_token | default('') | length > 0
+
+- name: Read this node's taints
+  ansible.builtin.command: >-
+    {{ stratum_bin_path }} kubectl get node {{ stratum_node_name }}
+    -o jsonpath={.spec.taints[*].key}
+  delegate_to: "{{ stratum_bootstrap_host }}"
+  register: stratum_taints
+  changed_when: false
+  check_mode: false
+  when:
+    - stratum_control_plane_taint | bool
+    - stratum_node_role == 'control_plane'
+    - not ansible_check_mode
+
+- name: Keep workloads off this control plane
+  ansible.builtin.command: >-
+    {{ stratum_bin_path }} kubectl taint nodes {{ stratum_node_name }}
+    node-role.kubernetes.io/control-plane:NoSchedule
+  delegate_to: "{{ stratum_bootstrap_host }}"
+  changed_when: true
+  when:
+    - stratum_control_plane_taint | bool
+    - stratum_node_role == 'control_plane'
+    - not ansible_check_mode
+    - "'node-role.kubernetes.io/control-plane' not in stratum_taints.stdout.split()"
+
+- name: Export the admin kubeconfig
+  ansible.builtin.include_tasks: kubeconfig.yml
+  when:
+    - stratum_fetch_kubeconfig | bool
+    - inventory_hostname == stratum_bootstrap_host
+    - not ansible_check_mode

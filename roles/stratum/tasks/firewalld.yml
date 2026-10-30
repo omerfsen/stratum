@@ -1,0 +1,96 @@
+---
+# CIQ's tested configuration (Rocky 9.8, firewalld nftables backend): a zone
+# bound to the node subnet with the cluster ports, and the pod range in
+# "trusted". Changes are permanent and immediate. The only reload is the one
+# that loads a newly created zone, before Cilium has rules to lose (on the
+# iptables backend a reload flushes Cilium's rules).
+
+- name: Read the service states
+  ansible.builtin.service_facts:
+
+- name: Manage firewalld
+  when: >-
+    stratum_firewalld | string | lower == 'true'
+    or ansible_facts['services']['firewalld.service']['state'] | default('') == 'running'
+  block:
+    - name: The node subnet is set
+      ansible.builtin.assert:
+        that: stratum_node_cidr | length > 0
+        fail_msg: Set stratum_node_cidr (the node subnet) to manage firewalld.
+        quiet: true
+
+    - name: Install firewalld
+      ansible.builtin.dnf:
+        name: firewalld
+        state: present
+
+    - name: Start and enable firewalld
+      ansible.builtin.systemd_service:
+        name: firewalld
+        state: started
+        enabled: true
+
+    - name: List the zones
+      ansible.builtin.command: firewall-cmd --permanent --get-zones
+      register: stratum_firewalld_zones
+      changed_when: false
+      check_mode: false
+
+    - name: Create the zone {{ stratum_firewalld_zone }}
+      ansible.builtin.command: firewall-cmd --permanent --new-zone={{ stratum_firewalld_zone }}
+      when: stratum_firewalld_zone not in stratum_firewalld_zones.stdout.split()
+      changed_when: true
+      notify: Load the new firewalld zone
+
+    - name: Load a new zone now
+      ansible.builtin.meta: flush_handlers
+
+    - name: Bind the node subnet to zone {{ stratum_firewalld_zone }}
+      ansible.posix.firewalld:
+        zone: "{{ stratum_firewalld_zone }}"
+        source: "{{ stratum_node_cidr }}"
+        permanent: true
+        immediate: true
+        state: enabled
+
+    - name: Open the cluster ports
+      ansible.posix.firewalld:
+        zone: "{{ stratum_firewalld_zone }}"
+        port: "{{ item }}"
+        permanent: true
+        immediate: true
+        state: enabled
+      loop: "{{ stratum_firewalld_ports + ([stratum_dashboard_port ~ '/tcp'] if stratum_dashboard_port | int > 0 else []) }}"
+      vars:
+        stratum_firewalld_ports:
+          - 6443/tcp        # API server
+          - 10250/tcp       # kubelet
+          - 2379-2380/tcp   # etcd (control planes)
+          - 9448/tcp        # Stratum admission webhook
+          - 8472/udp        # Cilium VXLAN
+          - 4240/tcp        # Cilium health
+
+    - name: Allow SSH in zone {{ stratum_firewalld_zone }}
+      ansible.posix.firewalld:
+        zone: "{{ stratum_firewalld_zone }}"
+        service: ssh
+        permanent: true
+        immediate: true
+        state: enabled
+
+    # Cilium health checks ping every node; ICMP blocks stay off in the zone.
+    - name: Allow ICMP echo in zone {{ stratum_firewalld_zone }}
+      ansible.posix.firewalld:
+        zone: "{{ stratum_firewalld_zone }}"
+        icmp_block_inversion: false
+        permanent: true
+        immediate: true
+        state: enabled
+
+    - name: Trust the pod range
+      ansible.posix.firewalld:
+        zone: trusted
+        source: "{{ stratum_pod_cidr }}"
+        permanent: true
+        immediate: true
+        state: enabled

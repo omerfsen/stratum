@@ -1,0 +1,92 @@
+---
+# Destroys the Stratum VMs on the kvm_hosts (domain, UEFI vars, disk,
+# cloud-init seed) and the exported kubeconfig. Irreversible: the cluster and
+# everything in it is gone. The base image, the binary cache and the SSH keys
+# stay, so the next run downloads nothing.
+#
+#   ansible-playbook -i inventory/kvm omerfsen.stratum.kvm_destroy -e stratum_kvm_destroy_confirm=yes
+
+- name: Destroy the Stratum VMs
+  hosts: kvm_hosts
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Confirmation
+      ansible.builtin.assert:
+        that: stratum_kvm_destroy_confirm | default('') == 'yes'
+        fail_msg: This destroys the cluster's VMs. Rerun with -e stratum_kvm_destroy_confirm=yes.
+        quiet: true
+
+    - name: Stop and undefine the VMs on this hypervisor
+      ansible.builtin.shell: |
+        set -o pipefail
+        virsh dominfo {{ item.name }} >/dev/null 2>&1 || exit 0
+        virsh destroy {{ item.name }} >/dev/null 2>&1 || true
+        virsh undefine {{ item.name }} --nvram >/dev/null
+        echo removed
+      args: {executable: /bin/bash}
+      loop: "{{ stratum_kvm_nodes | selectattr('kvm_host', 'eq', inventory_hostname) | list }}"
+      loop_control: {label: "{{ item.name }}"}
+      register: stratum_kvm_undefine
+      changed_when: "'removed' in stratum_kvm_undefine.stdout"
+
+    - name: Remove their disks and seeds
+      ansible.builtin.file:
+        path: "{{ libvirt_vm_disk_path | default('/var/lib/libvirt/images') }}/{{ item.0.name }}{{ item.1 }}"
+        state: absent
+      loop: "{{ stratum_kvm_nodes | selectattr('kvm_host', 'eq', inventory_hostname) | product(['.qcow2', '-seed.iso']) | list }}"
+      loop_control: {label: "{{ item.0.name }}{{ item.1 }}"}
+
+    - name: Forget the VMs' SSH host keys on the controller (rebuilt VMs get new ones)
+      ansible.builtin.command: ssh-keygen -R {{ item.ip }}
+      loop: "{{ stratum_kvm_nodes }}"
+      loop_control: {label: "{{ item.ip }}"}
+      delegate_to: localhost
+      become: false
+      run_once: true
+      changed_when: false
+      failed_when: false
+
+    - name: Remove the kubeconfig from the controller
+      ansible.builtin.file:
+        path: "{{ (stratum_kubeconfig_dest | default('~/.kube/' ~ stratum_cluster_name ~ '.yaml')) | expanduser }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Read the main kubeconfig on the controller
+      ansible.builtin.slurp:
+        src: "{{ (stratum_kubeconfig_merge_path | default('~/.kube/config')) | expanduser }}"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      register: stratum_kvm_main_kubeconfig
+      failed_when: false
+      no_log: true
+
+    # Only the entries named after the cluster go; a backup is taken first.
+    - name: Remove the cluster from the main kubeconfig
+      ansible.builtin.copy:
+        dest: "{{ (stratum_kubeconfig_merge_path | default('~/.kube/config')) | expanduser }}"
+        content: >-
+          {%- set old = stratum_kvm_main_kubeconfig.content | b64decode | from_yaml -%}
+          {%- set name = stratum_cluster_name -%}
+          {%- set new = old | combine({
+                'clusters': old.clusters | default([], true) | rejectattr('name', 'eq', name) | list,
+                'users': old.users | default([], true) | rejectattr('name', 'eq', name) | list,
+                'contexts': old.contexts | default([], true) | rejectattr('name', 'eq', name) | list}) -%}
+          {%- if old['current-context'] | default('') == name -%}
+          {%-   set new = new | combine({'current-context': ''}) -%}
+          {%- endif -%}
+          {{ new | to_nice_yaml(indent=2) }}
+        mode: "0600"
+        backup: true
+      delegate_to: localhost
+      become: false
+      run_once: true
+      no_log: true
+      when:
+        - stratum_kvm_main_kubeconfig.content is defined
+        - (stratum_kvm_main_kubeconfig.content | b64decode | from_yaml).contexts | default([], true)
+          | selectattr('name', 'eq', stratum_cluster_name) | list | length > 0

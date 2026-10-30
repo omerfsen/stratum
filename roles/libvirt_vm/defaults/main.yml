@@ -1,0 +1,36 @@
+---
+# One VM per call: include the role with libvirt_vm_name, libvirt_vm_ip and
+# sizes set. Runs on the KVM host as root.
+
+# Required per VM. Sizes apply when the VM is created.
+libvirt_vm_name: ""
+libvirt_vm_ip: ""
+libvirt_vm_vcpus: 4
+libvirt_vm_memory_mb: 8192
+libvirt_vm_disk_gb: 40
+
+# Cloud image, pinned to one build and its checksum. Default: Rocky Linux 10.2
+# GenericCloud (https://dl.rockylinux.org/pub/rocky/10.2/images/x86_64/CHECKSUM).
+libvirt_vm_image_url: https://dl.rockylinux.org/pub/rocky/10.2/images/x86_64/Rocky-10-GenericCloud-Base-10.2-20260525.0.x86_64.qcow2
+libvirt_vm_image_checksum: sha256:9fc9e9ff16888bb68ac39b0392e25c9c92684d50c85f1cce6ab549363bbc4b48
+# virt-install's osinfo database has no rocky10 yet; RHEL 10.1 is the same platform.
+libvirt_vm_osinfo: rhel10.1
+
+# Network: a libvirt network, or a host bridge (bridge wins when set). The
+# address is static and must be outside any DHCP range.
+libvirt_vm_network: default
+libvirt_vm_bridge: ""
+libvirt_vm_prefix: 24
+libvirt_vm_gateway: 192.168.122.1
+libvirt_vm_dns: [192.168.122.1]
+
+libvirt_vm_user: rocky
+libvirt_vm_autostart: true
+libvirt_vm_disk_path: /var/lib/libvirt/images
+# The NIC's MAC; cloud-init matches the static address to it. Empty: derived
+# from the VM name, so the same VM always gets the same MAC. Set it to pin one
+# yourself (DHCP reservations, licences bound to a MAC, ...).
+libvirt_vm_mac: ""
+# One ed25519 keypair per VM, generated on the controller.
+libvirt_vm_ssh_key_dir: "~/.ssh/stratum"
+libvirt_vm_ssh_key_path: "{{ libvirt_vm_ssh_key_dir | expanduser }}/{{ libvirt_vm_name }}_ed25519"

@@ -1,0 +1,39 @@
+---
+# A Stratum cluster on any inventory with the groups stratum_control_plane
+# (1, 3 or 5; the first one bootstraps) and stratum_workers (0 or more).
+#
+#   ansible-playbook -i inventory omerfsen.stratum.cluster
+
+- name: Prepare the nodes and install the binary
+  hosts: stratum_control_plane:stratum_workers
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Prepare
+      ansible.builtin.include_role:
+        name: omerfsen.stratum.stratum
+        tasks_from: prepare
+
+# Control planes one at a time: etcd grows one member at a time, and a join
+# that overlaps another loses quorum.
+- name: Bootstrap and join the control planes
+  hosts: stratum_control_plane
+  become: true
+  gather_facts: false
+  serial: 1
+  tasks:
+    - name: Bootstrap or join
+      ansible.builtin.include_role:
+        name: omerfsen.stratum.stratum
+        tasks_from: node
+
+# Workers can join together; each mints its own token.
+- name: Join the workers
+  hosts: stratum_workers
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Join
+      ansible.builtin.include_role:
+        name: omerfsen.stratum.stratum
+        tasks_from: node

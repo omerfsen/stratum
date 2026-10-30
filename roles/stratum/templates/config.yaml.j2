@@ -1,0 +1,14 @@
+# Managed by Ansible (omerfsen.stratum.stratum). Read by `stratum up` and on every
+# start; the network block is fixed after the cluster's first boot.
+{% set spec = {'network': {'nodeIP': stratum_node_ip}, 'selinux': stratum_selinux | bool} %}
+{% if stratum_node_role == 'control_plane' %}
+{%   set _ = spec.network.update({'podCIDR': stratum_pod_cidr, 'serviceCIDR': stratum_service_cidr, 'clusterDomain': stratum_cluster_domain}) %}
+{%   if stratum_vip | length > 0 %}
+{%     set _ = spec.update({'vip': {'address': stratum_vip} | combine({'interface': stratum_vip_interface} if stratum_vip_interface | length > 0 else {})}) %}
+{%   endif %}
+{%   if stratum_profile | length > 0 %}
+{%     set _ = spec.update({'profile': stratum_profile}) %}
+{%   endif %}
+{%   set spec = spec | combine(stratum_extra_config, recursive=true) %}
+{% endif %}
+{{ {'kind': 'ClusterConfig', 'spec': spec} | to_nice_yaml(indent=2) }}

@@ -1,0 +1,6 @@
+---
+# Only after creating a zone: a new zone exists in the runtime config only
+# after a reload. Runs before Cilium has rules on a fresh node.
+- name: Load the new firewalld zone
+  ansible.builtin.command: firewall-cmd --reload
+  changed_when: true

@@ -1,0 +1,74 @@
+---
+# Wait until this node serves: the API through the VIP and its etcd member
+# (control planes), then the Node registered and Ready.
+
+- name: Wait for the API server through the VIP
+  ansible.builtin.command: "{{ stratum_bin_path }} kubectl get --raw /healthz"
+  delegate_to: "{{ stratum_bootstrap_host }}"
+  register: stratum_healthz
+  until: stratum_healthz.rc == 0 and stratum_healthz.stdout == 'ok'
+  retries: 60
+  delay: 5
+  changed_when: false
+  when: stratum_node_role == 'control_plane'
+
+# Joins must not overlap: the next control plane only joins once this one is
+# a started etcd member.
+- name: Wait for this control plane's etcd member
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ stratum_bin_path }} etcdctl member list | grep -c ', started, {{ stratum_node_name }},'
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ stratum_bootstrap_host }}"
+  register: stratum_etcd_member
+  until: stratum_etcd_member.stdout | default('0') | int == 1
+  retries: 60
+  delay: 5
+  changed_when: false
+  when: stratum_node_role == 'control_plane'
+
+# The kubelet starts before the Node registers (a worker first completes its
+# TLS bootstrap); wait for the Node object, then for Ready.
+- name: Wait for this node to register
+  ansible.builtin.command: "{{ stratum_bin_path }} kubectl get node {{ stratum_node_name }} -o name"
+  delegate_to: "{{ stratum_bootstrap_host }}"
+  register: stratum_node_registered
+  until: stratum_node_registered.rc == 0
+  retries: 60
+  delay: 10
+  changed_when: false
+
+- name: Wait for this node to be Ready
+  ansible.builtin.command: >-
+    {{ stratum_bin_path }} kubectl wait node/{{ stratum_node_name }}
+    --for=condition=Ready --timeout=600s
+  delegate_to: "{{ stratum_bootstrap_host }}"
+  changed_when: false
+
+# Ready does not need the kubelet's serving certificate, but `kubectl logs`,
+# `exec` and `top` do. The operator approves it when its names match the
+# node's addresses; say so if it stays pending.
+- name: Wait for the kubelet serving certificate
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ stratum_bin_path }} kubectl get csr \
+      -o jsonpath='{range .items[*]}{.spec.signerName} {.spec.username} {.status.conditions[*].type}{"\n"}{end}' \
+      | awk '$1 == "kubernetes.io/kubelet-serving" && $2 == "system:node:{{ stratum_node_name }}" && NF == 2' | wc -l
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ stratum_bootstrap_host }}"
+  register: stratum_serving_pending
+  until: stratum_serving_pending.stdout | int == 0
+  retries: 12
+  delay: 5
+  changed_when: false
+  failed_when: false
+
+- name: Warn about a pending serving certificate
+  ansible.builtin.debug:
+    msg: >-
+      The kubelet serving certificate of {{ stratum_node_name }} is still pending; kubectl
+      logs/exec/top will fail on this node until it is approved. Check that the node's
+      addresses (stratum_node_ip) are the ones its kubelet uses.
+  when: stratum_serving_pending.stdout | default('0') | int > 0

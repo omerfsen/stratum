@@ -1,0 +1,89 @@
+---
+# The single Stratum binary (~700 MB, Kubernetes and all images inside), with
+# its sha256 always checked and its cosign signature optionally verified.
+
+- name: Pick the build for this architecture
+  ansible.builtin.set_fact:
+    stratum_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] }}"
+
+- name: A checksum is known for this release
+  ansible.builtin.assert:
+    that: stratum_sha256[stratum_arch] | default('') | length == 64
+    fail_msg: >-
+      No sha256 for {{ stratum_version }} ({{ stratum_arch }}). Supported:
+      {{ stratum_releases.keys() | join(', ') }}; for another release set
+      stratum_sha256 from its sha256sums.txt.
+    quiet: true
+
+- name: Already installed at this version?
+  ansible.builtin.stat:
+    path: "{{ stratum_bin_path }}"
+    checksum_algorithm: sha256
+  register: stratum_installed
+
+# A new binary under a running node is a silent upgrade at its next restart,
+# outside `stratum upgrade` and node by node at random. Refuse it.
+- name: Is this node already in a cluster?
+  ansible.builtin.stat:
+    path: /var/lib/stratum/config/node.yaml
+  register: stratum_binary_node_state
+
+- name: Never swap the binary of a running node
+  ansible.builtin.assert:
+    that: >-
+      not stratum_installed.stat.exists
+      or stratum_installed.stat.checksum == stratum_sha256[stratum_arch]
+      or not stratum_binary_node_state.stat.exists
+      or stratum_allow_binary_replace | bool
+    fail_msg: >-
+      {{ stratum_bin_path }} on this cluster node is not {{ stratum_version }}. Upgrade a
+      cluster with `stratum upgrade` (see Stratum's upgrade documentation), or set
+      stratum_allow_binary_replace=true to replace the binary anyway.
+    quiet: true
+
+- name: Signature checks need the release URL
+  ansible.builtin.assert:
+    that: not (stratum_verify_signature | bool and stratum_binary_local_path | length > 0)
+    fail_msg: >-
+      stratum_verify_signature downloads the signature from the release URL and needs
+      Sigstore online; with stratum_binary_local_path verify the binary before copying it in.
+    quiet: true
+
+- name: Install the binary
+  when: stratum_installed.stat.checksum | default('') != stratum_sha256[stratum_arch]
+  block:
+    - name: Fetch on the controller
+      ansible.builtin.include_tasks: binary_controller.yml
+      when: stratum_binary_source == 'controller'
+
+    - name: Push to the node
+      ansible.builtin.copy:
+        src: "{{ stratum_controller_file }}"
+        dest: "{{ stratum_bin_path }}"
+        owner: root
+        group: root
+        mode: "0755"
+      when: stratum_binary_source == 'controller'
+
+    - name: Download on the node (sha256 verified)
+      ansible.builtin.get_url:
+        url: "{{ stratum_release_url }}/{{ stratum_version }}/stratum-linux-{{ stratum_arch }}"
+        dest: "{{ stratum_bin_path }}"
+        checksum: "sha256:{{ stratum_sha256[stratum_arch] }}"
+        owner: root
+        group: root
+        mode: "0755"
+        timeout: 120
+      when: stratum_binary_source == 'node'
+
+- name: Installed version
+  ansible.builtin.command: "{{ stratum_bin_path }} version"
+  register: stratum_version_out
+  changed_when: false
+  check_mode: false
+
+- name: The binary must report {{ stratum_version }}
+  ansible.builtin.assert:
+    that: stratum_version_out.stdout.split()[0] | default('') == stratum_version
+    fail_msg: "{{ stratum_bin_path }} reports {{ stratum_version_out.stdout }}, expected {{ stratum_version }}"
+    quiet: true

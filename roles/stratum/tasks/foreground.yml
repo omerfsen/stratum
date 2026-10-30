@@ -1,0 +1,20 @@
+---
+# The `stratum up` processes on this node that stratum.service does not run:
+# the first start (the stratum-first-up unit from up.yml), or one an
+# interrupted run left behind. stratum.service's own process is never listed.
+- name: List foreground stratum up processes
+  ansible.builtin.shell: |
+    set -uo pipefail
+    main=$(systemctl show -p MainPID --value stratum.service 2>/dev/null) || main=0
+    for pid in $(pgrep -f '^{{ stratum_bin_path }} up( |$)'); do
+      [ "$pid" = "$main" ] || echo "$pid"
+    done
+  args:
+    executable: /bin/bash
+  register: stratum_foreground
+  changed_when: false
+  check_mode: false
+
+- name: Record them
+  ansible.builtin.set_fact:
+    stratum_foreground_pids: "{{ stratum_foreground.stdout_lines }}"

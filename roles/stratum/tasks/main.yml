@@ -1,0 +1,10 @@
+---
+# The whole node in one go: prepare (host, firewalld, binary), then bootstrap
+# or join. Run with `serial: 1`, control planes first, or use the two entry
+# points as playbooks/cluster.yml does: tasks_from prepare on all nodes at
+# once, then tasks_from node one at a time.
+- name: Prepare the host
+  ansible.builtin.include_tasks: prepare.yml
+
+- name: Bootstrap or join
+  ansible.builtin.include_tasks: node.yml

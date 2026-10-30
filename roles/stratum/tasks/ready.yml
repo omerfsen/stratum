@@ -1,0 +1,27 @@
+---
+# Wait until a first `stratum up` (pid in stratum_up_started.stdout, or the
+# pids in stratum_wait_pids) has brought the node far enough to hand it to
+# systemd. Sets stratum_up_state.stdout to ready, exited or waiting (timeout).
+#   worker:        kubelet-client-current.pem exists (TLS bootstrap done)
+#   control plane: "node <name> registered after" logged, local etcd WAL present
+- name: Wait for the node to be ready for the handover
+  ansible.builtin.shell: |
+    set -u
+    pids="{{ stratum_wait_pids | default([stratum_up_started.stdout | default('')]) | join(' ') }}"
+    {% if stratum_node_role == 'worker' %}
+    [ -s /var/lib/stratum/pki/kubelet/kubelet-client-current.pem ] && { echo ready; exit 0; }
+    {% else %}
+    if grep -q 'node {{ stratum_node_name }} registered after' {{ stratum_first_up_log }} 2>/dev/null \
+       && [ -n "$(ls -A /var/lib/stratum/etcd/member/wal 2>/dev/null)" ]; then
+      echo ready; exit 0
+    fi
+    {% endif %}
+    kill -0 $pids 2>/dev/null || { echo exited; exit 0; }
+    echo waiting
+  args:
+    executable: /bin/bash
+  register: stratum_up_state
+  until: stratum_up_state.stdout != 'waiting'
+  retries: "{{ (stratum_up_timeout | int / 10) | int }}"
+  delay: 10
+  changed_when: false

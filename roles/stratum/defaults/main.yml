@@ -1,0 +1,102 @@
+---
+# omerfsen.stratum.stratum. Every variable is listed, with its type, in
+# meta/argument_specs.yml.
+
+# ── Inventory ────────────────────────────────────────────────────────────
+# The first host of the control-plane group bootstraps the cluster, the other
+# control planes join it through the VIP, the worker group joins as workers.
+stratum_control_plane_group: stratum_control_plane
+stratum_worker_group: stratum_workers
+
+# ── Release ──────────────────────────────────────────────────────────────
+# The supported releases, one per Kubernetes minor, with the sha256 of each
+# binary from the release's sha256sums.txt
+# (https://github.com/ctrliq/stratum/releases). Pick one with stratum_version;
+# for any other release, also set stratum_sha256.
+stratum_releases:
+  v1.37.1-stratum.0:
+    amd64: d8a1e7be186c7d75a5f74409d68e5efc834c055b4020d3a11bde9f8ad4211859
+    arm64: 1d58748829673af5109a114f5780eb227e86696b04118dfb8bd7bb2467e0408c
+  v1.36.5-stratum.0:
+    amd64: 37e3f17393a0908376e196ed32c38c9e2c1b2fa883051d4d49a65fd38c52078c
+    arm64: cde578ab6d975e9d3dc23eb58ba82bffe71df04b7a72126e2961bcd4638d3fe8
+  v1.35.9-stratum.0:
+    amd64: 9c8c97449d00fff130eb91c5497a6a6d7999121321f2b58ea4bffa7c8fb9c221
+    arm64: e642130fee3376e9cc9762c1d3e56886b76cc4b76ac3c2e9115505e2c4816629
+stratum_version: v1.37.1-stratum.0
+stratum_sha256: "{{ stratum_releases[stratum_version] | default({}) }}"
+
+# Where the binary comes from:
+#   controller  downloaded once onto the Ansible controller, pushed to each
+#               node (nodes need no internet access)
+#   node        each node downloads it itself
+stratum_binary_source: controller
+stratum_release_url: https://github.com/ctrliq/stratum/releases/download
+# Air-gapped: path of an already downloaded binary on the controller. Skips
+# the download; the sha256 is still checked.
+stratum_binary_local_path: ""
+stratum_controller_cache_dir: "~/.cache/stratum/{{ stratum_version }}"
+# Verify the keyless cosign signature of the release (needs cosign on the controller).
+stratum_verify_signature: false
+stratum_signature_identity: "https://github.com/ctrliq/stratum/.github/workflows/release.yml@refs/tags/{{ stratum_version }}"
+stratum_signature_issuer: https://token.actions.githubusercontent.com
+stratum_bin_path: /usr/local/bin/stratum
+# Replace the binary on a node that is already in a cluster. Off: upgrades
+# go through `stratum upgrade`, not a file swap under a running node.
+stratum_allow_binary_replace: false
+
+# ── Host ─────────────────────────────────────────────────────────────────
+# Fail when SELinux is not enforcing (Stratum also runs permissive/disabled).
+stratum_require_selinux_enforcing: true
+# firewalld: auto = configure it only where it already runs, true = install
+# and enable it, false = never touch it. Stratum opens no ports itself.
+stratum_firewalld: auto
+stratum_firewalld_zone: stratum
+# The node subnet bound to the firewalld zone, e.g. 10.0.10.0/24. Required
+# whenever firewalld is managed.
+stratum_node_cidr: ""
+# NodePort of the Stratum dashboard, opened in firewalld; 0 keeps it closed.
+stratum_dashboard_port: 30443
+
+# ── Node ─────────────────────────────────────────────────────────────────
+# The address Kubernetes uses for this node. Default: the default-route IPv4.
+stratum_node_ip: "{{ ansible_facts['default_ipv4']['address'] | default('') }}"
+
+# Highly available control planes: a free address on the node subnet, held
+# by kube-vip (ARP). Required with more than one control plane; workers and
+# the exported kubeconfig use it.
+stratum_vip: ""
+stratum_vip_interface: ""       # default: the default-route interface
+
+# Cluster network. Set by the first control plane's first boot, fixed after.
+stratum_pod_cidr: 10.245.0.0/16
+stratum_service_cidr: 10.96.0.0/12
+stratum_cluster_domain: cluster.local
+
+stratum_selinux: true
+stratum_profile: ""             # "cis": CIS hardening profile (a Stratum PRO feature)
+# Merged into spec of /etc/stratum/config.yaml on control planes, for
+# settings without a variable here (snapshots, dashboard, cilium, ...).
+stratum_extra_config: {}
+
+# Keep workloads off the control planes (Stratum's default lets them run).
+stratum_control_plane_taint: false
+
+# Seconds allowed for one first `stratum up` (bootstrap or join).
+stratum_up_timeout: 1800
+# Join tokens are minted per join, passed by file, revoked once the node is
+# Ready, and expire after this at the latest. Longer than every wait of one
+# join, or a slow join's certificate request is refused for an expired token.
+stratum_join_token_ttl: "{{ (stratum_up_timeout | int // 60) + 15 }}m"
+
+# Copy an admin kubeconfig to the controller.
+stratum_fetch_kubeconfig: true
+stratum_cluster_name: stratum
+stratum_kubeconfig_dest: "~/.kube/{{ stratum_cluster_name }}.yaml"
+# Also merge it into the main kubeconfig (off by default: ~/.kube/config is
+# never touched unless asked). Entries named stratum_cluster_name are
+# replaced, all others kept, a backup is taken before each change.
+stratum_kubeconfig_merge: false
+stratum_kubeconfig_merge_path: ~/.kube/config
+# When merging, make the merged context the current one.
+stratum_kubeconfig_set_current: true

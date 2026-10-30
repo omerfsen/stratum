@@ -1,0 +1,22 @@
+---
+# Existing hosts (bare metal, or VMs from any platform): three control planes
+# behind a VIP and two workers. RHEL-family 9+, root via become.
+#
+#   ansible-playbook -i examples/inventory/bare-metal.yml omerfsen.stratum.cluster
+all:
+  vars:
+    ansible_user: admin
+    stratum_vip: 10.0.10.10            # free address on the node subnet
+    stratum_node_cidr: 10.0.10.0/24
+    stratum_firewalld: auto            # configure firewalld where it runs
+    stratum_control_plane_taint: true  # workloads on workers only
+  children:
+    stratum_control_plane:
+      hosts:
+        cp1.example.com: {ansible_host: 10.0.10.11}
+        cp2.example.com: {ansible_host: 10.0.10.12}
+        cp3.example.com: {ansible_host: 10.0.10.13}
+    stratum_workers:
+      hosts:
+        worker1.example.com: {ansible_host: 10.0.10.21}
+        worker2.example.com: {ansible_host: 10.0.10.22}

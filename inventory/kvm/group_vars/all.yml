@@ -1,0 +1,70 @@
+---
+# Stratum on KVM/libvirt: the VMs and the cluster on them. Override in
+# group_vars/all/local.yml (gitignored) or with -e.
+
+# ── Network ──────────────────────────────────────────────────────────────
+# NAT (default): libvirt's "default" network. Bridged: set stratum_kvm_bridge
+# to a host bridge on your LAN (e.g. br0), and the subnet/gateway to the LAN's.
+# Static addresses, outside any DHCP range:
+#   .<vip_octet> VIP, .<cp_octet_base + N> control plane N, .<worker_octet_base + N> worker N
+stratum_kvm_network: default
+stratum_kvm_bridge: ""
+stratum_kvm_subnet: 192.168.122
+stratum_kvm_prefix: 24
+stratum_kvm_gateway: 192.168.122.1
+stratum_kvm_dns: [192.168.122.1]
+stratum_kvm_vip_octet: 80
+stratum_kvm_cp_octet_base: 80
+stratum_kvm_worker_octet_base: 90
+
+# Reach VMs behind a remote hypervisor's NAT network through that hypervisor
+# (SSH ProxyJump). auto: only for remote hypervisors without a bridge.
+stratum_kvm_proxy_jump: auto
+
+# ── Nodes ────────────────────────────────────────────────────────────────
+# Control planes: 1, 3 or 5 (etcd quorum). Workers: 0 or more; raise the
+# count and rerun to add workers.
+stratum_kvm_control_plane_count: 3
+stratum_kvm_worker_count: 2
+stratum_kvm_control_plane_size: {vcpus: 4, memory_mb: 6144, disk_gb: 40}
+stratum_kvm_worker_size: {vcpus: 4, memory_mb: 4096, disk_gb: 40}
+stratum_kvm_name_prefix: stratum
+# Per-node overrides of the sizes above, by VM name, e.g. one large worker:
+# stratum_kvm_node_sizes: {stratum-w1: {vcpus: 16, memory_mb: 65536, disk_gb: 200}}
+stratum_kvm_node_sizes: {}
+
+# Pin a VM's MAC (default: derived from its name, stable across rebuilds).
+# stratum_kvm_macs: {stratum-cp1: "52:54:00:aa:bb:01"}
+stratum_kvm_macs: {}
+
+# Where each VM's SSH keypair is kept, on the controller.
+stratum_kvm_ssh_key_dir: ~/.ssh/stratum
+
+# Built from the above. Every node: name, ip, group, kvm_host, vcpus,
+# memory_mb, disk_gb. VMs go round robin over kvm_hosts, control planes first.
+stratum_kvm_nodes: >-
+  {%- set hosts = groups['kvm_hosts'] -%}
+  {%- set nodes = [] -%}
+  {%- for i in range(1, stratum_kvm_control_plane_count | int + 1) -%}
+  {%-   set _ = nodes.append(stratum_kvm_control_plane_size | combine({
+          'name': stratum_kvm_name_prefix ~ '-cp' ~ i,
+          'ip': stratum_kvm_subnet ~ '.' ~ (stratum_kvm_cp_octet_base | int + i),
+          'group': 'stratum_control_plane',
+          'kvm_host': hosts[(i - 1) % hosts | length]})
+        | combine(stratum_kvm_node_sizes[stratum_kvm_name_prefix ~ '-cp' ~ i] | default({}))) -%}
+  {%- endfor -%}
+  {%- for i in range(1, stratum_kvm_worker_count | int + 1) -%}
+  {%-   set _ = nodes.append(stratum_kvm_worker_size | combine({
+          'name': stratum_kvm_name_prefix ~ '-w' ~ i,
+          'ip': stratum_kvm_subnet ~ '.' ~ (stratum_kvm_worker_octet_base | int + i),
+          'group': 'stratum_workers',
+          'kvm_host': hosts[(i - 1) % hosts | length]})
+        | combine(stratum_kvm_node_sizes[stratum_kvm_name_prefix ~ '-w' ~ i] | default({}))) -%}
+  {%- endfor -%}
+  {{ nodes }}
+
+# ── Cluster (role omerfsen.stratum.stratum) ──────────────────────────────
+stratum_vip: "{{ stratum_kvm_subnet }}.{{ stratum_kvm_vip_octet }}"
+stratum_node_cidr: "{{ stratum_kvm_subnet }}.0/{{ stratum_kvm_prefix }}"
+stratum_firewalld: true
+stratum_cluster_name: stratum

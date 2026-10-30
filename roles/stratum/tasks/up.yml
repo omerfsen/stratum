@@ -1,0 +1,82 @@
+---
+# Runs `stratum <stratum_up_args>` the first time on this node. `stratum up`
+# never returns: it stays in the foreground and runs the node. So it runs as
+# a transient systemd unit (stratum-first-up, same KillMode and Delegate as
+# stratum.service), the play waits until the node can be handed over, and
+# handover.yml then stops it and starts stratum.service (which `up` enabled but
+# did not start).
+#
+# "Can be handed over" (see ready.yml):
+# - worker: the kubelet has its client certificate (kubelet-client-current.pem;
+#   kubelet.kubeconfig is written at the start of the bootstrap, so it proves
+#   nothing). Stopping it before that makes the next
+#   kubelet file a second bootstrap CSR, and the operator approves neither.
+# - control plane: Stratum has logged the node as registered and its local
+#   etcd has a WAL; without the WAL a restarted control plane refuses to start.
+
+- name: Start stratum up as a transient unit
+  ansible.builtin.shell: |
+    set -euo pipefail
+    umask 077
+    : > {{ stratum_first_up_log }}
+    systemd-run --unit=stratum-first-up --collect \
+      -p KillMode=process -p Delegate=yes \
+      -p StandardOutput=append:{{ stratum_first_up_log }} \
+      -p StandardError=append:{{ stratum_first_up_log }} \
+      {{ stratum_bin_path }} {{ stratum_up_args }} >/dev/null
+    systemctl show -p MainPID --value stratum-first-up | tee {{ stratum_first_up_pidfile }}
+  args:
+    executable: /bin/bash
+  register: stratum_up_started
+  changed_when: true
+
+- name: Wait until the node can be handed over
+  ansible.builtin.include_tasks: ready.yml
+
+- name: Read the log of the failed start
+  ansible.builtin.command: tail -n 40 {{ stratum_first_up_log }}
+  register: stratum_up_log_tail
+  changed_when: false
+  when: stratum_up_state.stdout != 'ready'
+
+# A worker whose bootstrap CSR stays pending: the operator writes why on it.
+- name: Read why the node's certificate is pending
+  ansible.builtin.command: >-
+    {{ stratum_bin_path }} kubectl get csr -o 'jsonpath={{ stratum_pending_jsonpath }}'
+  vars:
+    stratum_pending_annotation: stratum\.ciq\.com/node-client-pending
+    stratum_pending_jsonpath: >-
+      {range .items[?(@.metadata.annotations.{{ stratum_pending_annotation }})]}{.metadata.name}:
+      {.metadata.annotations.{{ stratum_pending_annotation }}}{"\n"}{end}
+  delegate_to: "{{ stratum_bootstrap_host }}"
+  register: stratum_pending_csrs
+  changed_when: false
+  failed_when: false
+  when:
+    - stratum_up_state.stdout != 'ready'
+    - stratum_node_role == 'worker'
+
+# Never leave a half-started `stratum up` behind for the next run to trip on.
+- name: Stop the failed start
+  ansible.builtin.systemd_service:
+    name: stratum-first-up
+    state: stopped
+  failed_when: false
+  when: stratum_up_state.stdout != 'ready'
+
+- name: Remove the failed start's pid file
+  ansible.builtin.file:
+    path: "{{ stratum_first_up_pidfile }}"
+    state: absent
+  when: stratum_up_state.stdout != 'ready'
+
+- name: Stratum up must bring the node up
+  ansible.builtin.fail:
+    msg: |-
+      `stratum up` on {{ inventory_hostname }} {{ 'exited' if stratum_up_state.stdout == 'exited' else 'did not finish in time' }}.
+      {% if stratum_pending_csrs.stdout | default('') | length > 0 %}
+      Pending certificate requests (Stratum operator): {{ stratum_pending_csrs.stdout }}
+      {% endif %}
+      Last lines of {{ stratum_first_up_log }}:
+      {{ stratum_up_log_tail.stdout }}
+  when: stratum_up_state.stdout != 'ready'

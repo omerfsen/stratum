@@ -1,0 +1,210 @@
+---
+# One cloud-image guest on libvirt: an SSH keypair (on the controller, so it
+# can reach the guest), a cloud-init seed with a static address on a libvirt
+# network or a host bridge, then virt-install. Runs on the KVM host.
+
+- name: Name and address are set
+  ansible.builtin.assert:
+    that: libvirt_vm_name | length > 0 and libvirt_vm_ip | length > 0
+    fail_msg: Set libvirt_vm_name and libvirt_vm_ip.
+    quiet: true
+
+- name: Use the given MAC, or derive a stable one from the name
+  ansible.builtin.set_fact:
+    libvirt_vm_mac_address: >-
+      {{ libvirt_vm_mac if libvirt_vm_mac | length > 0
+         else '52:54:00:' ~ ((libvirt_vm_name | hash('sha256'))[0:6] | regex_replace('(..)(..)(..)', '\1:\2:\3')) }}
+
+- name: The MAC is valid
+  ansible.builtin.assert:
+    that: libvirt_vm_mac_address is match('^([0-9a-f]{2}:){5}[0-9a-f]{2}$')
+    fail_msg: "libvirt_vm_mac {{ libvirt_vm_mac_address }} is not a lower-case MAC address."
+    quiet: true
+
+# ── Dedicated keypair, on the controller ─────────────────────────────────
+- name: Key directory on the controller
+  ansible.builtin.file:
+    path: "{{ libvirt_vm_ssh_key_dir | expanduser }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+
+- name: Generate the VM's SSH keypair
+  ansible.builtin.command: >-
+    ssh-keygen -q -t ed25519 -N '' -C ansible@{{ libvirt_vm_name }}
+    -f {{ libvirt_vm_ssh_key_path }}
+  args:
+    creates: "{{ libvirt_vm_ssh_key_path }}"
+  delegate_to: localhost
+  become: false
+
+- name: Read the public key
+  ansible.builtin.slurp:
+    src: "{{ libvirt_vm_ssh_key_path }}.pub"
+  delegate_to: localhost
+  become: false
+  register: libvirt_vm_pubkey
+
+# ── Disk: a copy of the base image, grown to size ────────────────────────
+- name: Fetch the base image once (checksum verified)
+  ansible.builtin.get_url:
+    url: "{{ libvirt_vm_image_url }}"
+    dest: "{{ libvirt_vm_disk_path }}/{{ libvirt_vm_image_url | basename }}"
+    checksum: "{{ libvirt_vm_image_checksum }}"
+    mode: "0644"
+    timeout: 120
+
+- name: Copy the base image to the VM's disk
+  ansible.builtin.copy:
+    src: "{{ libvirt_vm_disk_path }}/{{ libvirt_vm_image_url | basename }}"
+    dest: "{{ libvirt_vm_disk_path }}/{{ libvirt_vm_name }}.qcow2"
+    remote_src: true
+    force: false
+    mode: "0600"
+
+- name: Check whether the domain already exists
+  ansible.builtin.command: virsh dominfo {{ libvirt_vm_name }}
+  register: libvirt_vm_dominfo
+  failed_when: false
+  changed_when: false
+  check_mode: false
+
+- name: Read the disk's virtual size
+  ansible.builtin.command: qemu-img info --force-share --output=json {{ libvirt_vm_disk_path }}/{{ libvirt_vm_name }}.qcow2
+  register: libvirt_vm_disk_info
+  changed_when: false
+  check_mode: false
+
+# Sizes apply at creation: the disk is grown only while the VM does not exist
+# yet, before its first boot (cloud-init grows the partition and filesystem
+# then). An existing VM's disk is never touched.
+- name: Grow it to the requested size
+  ansible.builtin.command: qemu-img resize {{ libvirt_vm_disk_path }}/{{ libvirt_vm_name }}.qcow2 {{ libvirt_vm_disk_gb }}G
+  when:
+    - libvirt_vm_dominfo.rc != 0
+    - (libvirt_vm_disk_info.stdout | from_json)['virtual-size'] < (libvirt_vm_disk_gb | int) * 1024 ** 3
+  changed_when: true
+
+# ── cloud-init: static IP, our key ───────────────────────────────────────
+# Built once: the seed only matters for the guest's first boot.
+- name: Is the seed ISO already built?
+  ansible.builtin.stat:
+    path: "{{ libvirt_vm_disk_path }}/{{ libvirt_vm_name }}-seed.iso"
+  register: libvirt_vm_seed_iso
+
+- name: Build and pack the cloud-init seed
+  when: not libvirt_vm_seed_iso.stat.exists
+  block:
+    - name: Stage directory for the seed files
+      ansible.builtin.file:
+        path: "/tmp/seed-{{ libvirt_vm_name }}"
+        state: directory
+        mode: "0700"
+
+    - name: Write the seed files
+      ansible.builtin.copy:
+        dest: "/tmp/seed-{{ libvirt_vm_name }}/{{ libvirt_vm_seed_file.name }}"
+        mode: "0644"
+        content: "{{ libvirt_vm_seed_file.content }}"
+      loop:
+        - name: meta-data
+          content: |
+            instance-id: {{ libvirt_vm_name }}
+            local-hostname: {{ libvirt_vm_name }}
+        - name: user-data
+          content: |
+            #cloud-config
+            hostname: {{ libvirt_vm_name }}
+            fqdn: {{ libvirt_vm_name }}
+            users:
+              - name: {{ libvirt_vm_user }}
+                sudo: ALL=(ALL) NOPASSWD:ALL
+                shell: /bin/bash
+                lock_passwd: true
+                ssh_authorized_keys:
+                  - {{ libvirt_vm_pubkey.content | b64decode | trim }}
+            ssh_pwauth: false
+            # Grow the root filesystem into the resized disk on first boot.
+            growpart: {mode: auto, devices: ["/"]}
+            resize_rootfs: true
+        - name: network-config
+          content: |
+            version: 2
+            ethernets:
+              eth0:
+                # By MAC: the interface name differs between images.
+                match: {macaddress: "{{ libvirt_vm_mac_address }}"}
+                set-name: eth0
+                dhcp4: false
+                addresses: [{{ libvirt_vm_ip }}/{{ libvirt_vm_prefix }}]
+                routes:
+                  - to: 0.0.0.0/0
+                    via: {{ libvirt_vm_gateway }}
+                nameservers:
+                  addresses: {{ libvirt_vm_dns | to_json }}
+      loop_control: {loop_var: libvirt_vm_seed_file, label: "{{ libvirt_vm_seed_file.name }}"}
+
+    - name: Pack the seed ISO
+      ansible.builtin.command: >-
+        genisoimage -output {{ libvirt_vm_disk_path }}/{{ libvirt_vm_name }}-seed.iso
+        -volid cidata -joliet -rock
+        /tmp/seed-{{ libvirt_vm_name }}/user-data
+        /tmp/seed-{{ libvirt_vm_name }}/meta-data
+        /tmp/seed-{{ libvirt_vm_name }}/network-config
+      args: {creates: "{{ libvirt_vm_disk_path }}/{{ libvirt_vm_name }}-seed.iso"}
+
+  always:
+    - name: Remove the staged seed files
+      ansible.builtin.file:
+        path: "/tmp/seed-{{ libvirt_vm_name }}"
+        state: absent
+
+# ── Define and start the domain ──────────────────────────────────────────
+# host-passthrough: Rocky/RHEL 10 need x86-64-v3, which a generic QEMU CPU model
+# may not advertise.
+- name: Create the VM
+  ansible.builtin.command: >-
+    virt-install
+    --name {{ libvirt_vm_name }}
+    --vcpus {{ libvirt_vm_vcpus }}
+    --memory {{ libvirt_vm_memory_mb }}
+    --cpu host-passthrough
+    --machine q35
+    --boot uefi
+    --disk path={{ libvirt_vm_disk_path }}/{{ libvirt_vm_name }}.qcow2,format=qcow2,bus=virtio
+    --disk path={{ libvirt_vm_disk_path }}/{{ libvirt_vm_name }}-seed.iso,device=cdrom
+    --network {{ libvirt_vm_nic }},model=virtio,mac={{ libvirt_vm_mac_address }}
+    --graphics none
+    --console pty,target_type=serial
+    --osinfo {{ libvirt_vm_osinfo }}
+    --import
+    --noautoconsole
+  vars:
+    libvirt_vm_nic: "{{ ('bridge=' ~ libvirt_vm_bridge) if libvirt_vm_bridge | length > 0 else ('network=' ~ libvirt_vm_network) }}"
+  when: libvirt_vm_dominfo.rc != 0 and not ansible_check_mode
+  changed_when: true
+
+- name: Set whether the domain starts with the host
+  ansible.builtin.command: virsh autostart {{ '' if libvirt_vm_autostart else '--disable ' }}{{ libvirt_vm_name }}
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Start the guest if it is shut off
+  ansible.builtin.shell: |
+    set -o pipefail
+    if [ "$(virsh domstate {{ libvirt_vm_name }})" = "shut off" ]; then
+      virsh start {{ libvirt_vm_name }} >/dev/null && echo started
+    fi
+  args: {executable: /bin/bash}
+  register: libvirt_vm_started
+  changed_when: "'started' in libvirt_vm_started.stdout"
+  when: not ansible_check_mode
+
+- name: Wait for SSH on the static address
+  ansible.builtin.wait_for:
+    host: "{{ libvirt_vm_ip }}"
+    port: 22
+    timeout: 600
+    delay: 10
+  when: not ansible_check_mode

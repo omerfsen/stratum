@@ -1,0 +1,33 @@
+---
+# Hand a foreground `stratum up` over to stratum.service: SIGTERM (it exits
+# 0 and keeps the node's state), wait for it to go, start the unit.
+
+- name: Find the foreground stratum up
+  ansible.builtin.include_tasks: foreground.yml
+
+- name: Stop the foreground stratum up
+  ansible.builtin.shell: |
+    set -u
+    pids="{{ stratum_foreground_pids | join(' ') }}"
+    kill -TERM $pids
+    for _ in $(seq 120); do
+      kill -0 $pids 2>/dev/null || exit 0
+      sleep 1
+    done
+    echo "stratum up did not exit within 120 s" >&2
+    exit 1
+  args:
+    executable: /bin/bash
+  when: stratum_foreground_pids | length > 0
+  changed_when: true
+
+- name: Start stratum.service
+  ansible.builtin.systemd_service:
+    name: stratum
+    state: started
+    enabled: true
+
+- name: Remove the first start's pid file
+  ansible.builtin.file:
+    path: "{{ stratum_first_up_pidfile }}"
+    state: absent

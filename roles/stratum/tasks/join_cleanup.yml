@@ -1,0 +1,42 @@
+---
+# After a join, worked or not: the certificate key leaves the bootstrap
+# control plane, the token is revoked, and both are dropped from this run's
+# facts so no later template can read them.
+
+- name: Remove the certificate key from the bootstrap control plane
+  ansible.builtin.file:
+    path: "{{ stratum_join_key_src }}"
+    state: absent
+  delegate_to: "{{ stratum_bootstrap_host }}"
+  when: stratum_join_key_src | default('') | length > 0
+
+# The API can blink while a control plane joins (etcd membership and the VIP
+# move); retry, and if it stays away warn instead of failing the run: the
+# token expires after stratum_join_token_ttl regardless.
+- name: Revoke the join token
+  ansible.builtin.command: >-
+    {{ stratum_bin_path }} kubectl -n kube-system delete secret --ignore-not-found
+    bootstrap-token-{{ stratum_join_token.split('.')[0] }}
+  delegate_to: "{{ stratum_bootstrap_host }}"
+  register: stratum_revoke
+  until: stratum_revoke.rc == 0
+  retries: 24
+  delay: 5
+  changed_when: stratum_revoke.rc == 0 and 'deleted' in stratum_revoke.stdout
+  failed_when: false
+
+- name: Warn when the token could not be revoked
+  ansible.builtin.debug:
+    msg: >-
+      Could not delete Secret bootstrap-token-{{ stratum_join_token.split('.')[0] }}
+      ({{ stratum_revoke.stderr | default('') }}). It expires after {{ stratum_join_token_ttl }};
+      delete it by hand to revoke it now.
+  when: stratum_revoke.rc | default(0) != 0
+
+- name: Forget the join material
+  ansible.builtin.set_fact:
+    stratum_join_token: ""
+    stratum_join_args: []
+    stratum_join_up_args: ""
+    stratum_join_key_src: ""
+  no_log: true

@@ -1,0 +1,7 @@
+---
+# The cluster's first boot: `stratum up` reads /etc/stratum/config.yaml
+# (network ranges, VIP), unpacks the payload and starts the control plane.
+- name: Start the first control plane
+  ansible.builtin.include_tasks: up.yml
+  vars:
+    stratum_up_args: up

@@ -1,0 +1,63 @@
+---
+# Stratum on KVM/libvirt: the VMs on the kvm_hosts, then the cluster on them.
+#
+#   ansible-playbook -i inventory/kvm omerfsen.stratum.kvm
+
+- name: Create the VMs
+  hosts: kvm_hosts
+  become: true
+  gather_facts: false
+  tasks:
+    # Each hypervisor's NAT network is its own private subnet: VMs on
+    # different hypervisors could not reach each other.
+    - name: Several hypervisors need a shared bridge
+      ansible.builtin.assert:
+        that: groups['kvm_hosts'] | length == 1 or stratum_kvm_bridge | length > 0
+        fail_msg: With more than one hypervisor set stratum_kvm_bridge to a bridge on a network all of them share.
+        quiet: true
+      run_once: true
+
+    - name: Create the VMs placed on this hypervisor
+      ansible.builtin.include_role:
+        name: omerfsen.stratum.libvirt_vm
+      vars:
+        libvirt_vm_name: "{{ stratum_kvm_node.name }}"
+        libvirt_vm_ip: "{{ stratum_kvm_node.ip }}"
+        libvirt_vm_vcpus: "{{ stratum_kvm_node.vcpus }}"
+        libvirt_vm_memory_mb: "{{ stratum_kvm_node.memory_mb }}"
+        libvirt_vm_disk_gb: "{{ stratum_kvm_node.disk_gb }}"
+        libvirt_vm_mac: "{{ stratum_kvm_macs[stratum_kvm_node.name] | default('') }}"
+        libvirt_vm_network: "{{ stratum_kvm_network }}"
+        libvirt_vm_bridge: "{{ stratum_kvm_bridge }}"
+        libvirt_vm_prefix: "{{ stratum_kvm_prefix }}"
+        libvirt_vm_gateway: "{{ stratum_kvm_gateway }}"
+        libvirt_vm_dns: "{{ stratum_kvm_dns }}"
+        libvirt_vm_ssh_key_dir: "{{ stratum_kvm_ssh_key_dir }}"
+      loop: "{{ stratum_kvm_nodes | selectattr('kvm_host', 'eq', inventory_hostname) | list }}"
+      loop_control: {loop_var: stratum_kvm_node, label: "{{ stratum_kvm_node.name }}"}
+
+    - name: Add the VMs as Stratum nodes
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        groups: ["{{ item.group }}"]
+        ansible_host: "{{ item.ip }}"
+        ansible_user: rocky
+        ansible_ssh_private_key_file: "{{ stratum_kvm_ssh_key_dir | expanduser }}/{{ item.name }}_ed25519"
+        ansible_ssh_common_args: >-
+          -o StrictHostKeyChecking=accept-new
+          {{ ('-o ProxyJump=' ~ (hostvars[item.kvm_host].ansible_user ~ '@' if hostvars[item.kvm_host].ansible_user is defined else '')
+              ~ hostvars[item.kvm_host].ansible_host | default(item.kvm_host)) if stratum_kvm_jump | bool else '' }}
+        stratum_node_ip: "{{ item.ip }}"
+      vars:
+        stratum_kvm_jump: >-
+          {{ (stratum_kvm_proxy_jump | string | lower == 'true')
+             or (stratum_kvm_proxy_jump | string | lower == 'auto'
+                 and hostvars[item.kvm_host].ansible_connection | default('ssh') != 'local'
+                 and stratum_kvm_bridge | length == 0) }}
+      loop: "{{ stratum_kvm_nodes }}"
+      loop_control: {label: "{{ item.name }} on {{ item.kvm_host }}"}
+      run_once: true
+      changed_when: false
+
+- name: Stratum cluster
+  ansible.builtin.import_playbook: cluster.yml

@@ -1,0 +1,186 @@
+---
+# The prepare and node option sets are each written once (YAML anchors) and
+# merged for main.
+argument_specs:
+  prepare:
+    short_description: Host prerequisites, firewalld and the verified Stratum binary.
+    description:
+      - Checks platform (EL 9+, x86_64/aarch64), cgroup v2 and SELinux, and installs the required packages.
+      - Configures firewalld as in CIQ's tested setup, and installs the binary with its sha256 (and optionally cosign) verified.
+      - Safe to run on all nodes at once.
+    author: Omer Sen
+    options: &prepare_options
+      stratum_version:
+        type: str
+        default: v1.37.1-stratum.0
+        description: Stratum release tag. Supported out of the box are the keys of O(stratum_releases).
+      stratum_releases:
+        type: dict
+        description: Known releases and the sha256 of their binary per architecture (C(amd64), C(arm64)).
+      stratum_sha256:
+        type: dict
+        description:
+          - sha256 per architecture for O(stratum_version), from the release's sha256sums.txt.
+          - Default the entry in O(stratum_releases). Set it for a release not in that table.
+      stratum_binary_source:
+        type: str
+        choices: [controller, node]
+        default: controller
+        description:
+          - C(controller) downloads once on the controller and pushes to the nodes, which need no internet access.
+          - C(node) downloads on each node.
+      stratum_release_url:
+        type: str
+        default: https://github.com/ctrliq/stratum/releases/download
+        description: Base URL of the releases. Point it at a mirror if needed.
+      stratum_binary_local_path:
+        type: path
+        default: ""
+        description: Air-gapped installs. An already downloaded binary on the controller; its sha256 is still checked.
+      stratum_controller_cache_dir:
+        type: path
+        description: Download cache on the controller. Default C(~/.cache/stratum/<version>).
+      stratum_verify_signature:
+        type: bool
+        default: false
+        description: Verify the release's keyless cosign signature on the controller (needs cosign).
+      stratum_signature_identity:
+        type: str
+        description: Expected certificate identity. Default the upstream release workflow at the tag.
+      stratum_signature_issuer:
+        type: str
+        default: https://token.actions.githubusercontent.com
+        description: Expected OIDC issuer of the signing certificate.
+      stratum_bin_path:
+        type: path
+        default: /usr/local/bin/stratum
+        description: Install path on the nodes.
+      stratum_allow_binary_replace:
+        type: bool
+        default: false
+        description:
+          - Replace the binary on a node that is already in a cluster.
+          - Off, a different version on such a node fails the run; upgrade clusters with C(stratum upgrade).
+      stratum_require_selinux_enforcing:
+        type: bool
+        default: true
+        description: Fail unless SELinux is enforcing.
+      stratum_firewalld:
+        type: raw
+        default: auto
+        description:
+          - C(auto) configures firewalld only where it already runs.
+          - C(true) installs and enables it. C(false) never touches it.
+      stratum_firewalld_zone:
+        type: str
+        default: stratum
+        description: firewalld zone that holds the node subnet and the cluster ports.
+      stratum_node_cidr:
+        type: str
+        default: ""
+        description: Node subnet bound to the zone. Required when firewalld is managed.
+      stratum_dashboard_port:
+        type: int
+        default: 30443
+        description: Dashboard NodePort opened in firewalld; 0 keeps it closed.
+      stratum_pod_cidr:
+        type: str
+        default: 10.245.0.0/16
+        description: Pod range, trusted in firewalld. Must match the cluster's.
+
+  node:
+    short_description: Bootstrap the first control plane, join the others and the workers.
+    description:
+      - Writes /etc/stratum/config.yaml, then runs C(stratum up) on the first control plane.
+      - Other control planes run C(stratum up --join) through the VIP with the certificate key; workers run C(stratum up --worker).
+      - Join tokens are short-lived, passed by file and revoked after the join; the certificate key is removed from both nodes.
+      - Never runs C(stratum up) with join flags on a node that is already in the cluster.
+      - Also reads O(stratum_bin_path) and O(stratum_pod_cidr), documented under C(prepare).
+    author: Omer Sen
+    options: &node_options
+      stratum_control_plane_group:
+        type: str
+        default: stratum_control_plane
+        description: Inventory group of the control planes (an odd number). Its first host bootstraps.
+      stratum_worker_group:
+        type: str
+        default: stratum_workers
+        description: Inventory group of the workers.
+      stratum_node_ip:
+        type: str
+        description: Address Kubernetes uses for this node. Default the default-route IPv4.
+      stratum_vip:
+        type: str
+        default: ""
+        description: Control-plane VIP held by kube-vip. Required with more than one control plane.
+      stratum_vip_interface:
+        type: str
+        default: ""
+        description: Interface kube-vip announces the VIP on. Default the default-route interface.
+      stratum_service_cidr:
+        type: str
+        default: 10.96.0.0/12
+        description: Service range. Fixed after the cluster's first boot.
+      stratum_cluster_domain:
+        type: str
+        default: cluster.local
+        description: Cluster DNS domain. Fixed after the cluster's first boot.
+      stratum_selinux:
+        type: bool
+        default: true
+        description: Label Stratum's files for container-selinux.
+      stratum_profile:
+        type: str
+        default: ""
+        description: Node profile, e.g. C(cis). The CIS profile is part of Stratum PRO.
+      stratum_extra_config:
+        type: dict
+        default: {}
+        description: Merged into C(spec) of /etc/stratum/config.yaml on control planes.
+      stratum_control_plane_taint:
+        type: bool
+        default: false
+        description: Taint the control planes NoSchedule so workloads run on workers only.
+      stratum_join_token_ttl:
+        type: str
+        description:
+          - Lifetime of each join token; revoked earlier, once the node is Ready.
+          - Default O(stratum_up_timeout) plus 15 minutes (45m), longer than every wait of one join.
+      stratum_up_timeout:
+        type: int
+        default: 1800
+        description: Seconds allowed for one C(stratum up).
+      stratum_fetch_kubeconfig:
+        type: bool
+        default: true
+        description: Copy an admin kubeconfig to the controller.
+      stratum_cluster_name:
+        type: str
+        default: stratum
+        description: Name of the cluster, user and context in the exported and merged kubeconfig. Use a different one per cluster.
+      stratum_kubeconfig_dest:
+        type: path
+        description: Standalone kubeconfig on the controller. Default C(~/.kube/<cluster name>.yaml); empty writes none.
+      stratum_kubeconfig_merge:
+        type: bool
+        default: false
+        description:
+          - Also merge it into O(stratum_kubeconfig_merge_path). Off by default, so the main kubeconfig is never touched unless asked.
+          - Cluster, user and context entries named O(stratum_cluster_name) are replaced, all others kept; a backup is taken before each change.
+      stratum_kubeconfig_merge_path:
+        type: path
+        default: ~/.kube/config
+        description: The main kubeconfig to merge into.
+      stratum_kubeconfig_set_current:
+        type: bool
+        default: true
+        description: When merging, make the merged context the current one.
+
+  main:
+    short_description: Prepare a host and bootstrap or join it as a Stratum node.
+    description:
+      - Runs the C(prepare) and C(node) entry points in order.
+      - Use C(serial=1) with the control planes first, so etcd grows one member at a time.
+    author: Omer Sen
+    options:
+      <<: [*prepare_options, *node_options]

@@ -1,0 +1,70 @@
+---
+# Runs once per architecture on the controller: download (or take the local
+# file), check the sha256, optionally verify the cosign signature.
+
+- name: Controller file for {{ stratum_arch }}
+  ansible.builtin.set_fact:
+    stratum_controller_file: >-
+      {{ stratum_binary_local_path
+         if stratum_binary_local_path | length > 0
+         else (stratum_controller_cache_dir | expanduser) ~ '/stratum-linux-' ~ stratum_arch }}
+
+- name: Cache directory on the controller
+  ansible.builtin.file:
+    path: "{{ stratum_controller_cache_dir | expanduser }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: stratum_binary_local_path | length == 0
+
+- name: Download the release binary (sha256 verified)
+  ansible.builtin.get_url:
+    url: "{{ stratum_release_url }}/{{ stratum_version }}/stratum-linux-{{ stratum_arch }}"
+    dest: "{{ stratum_controller_file }}"
+    checksum: "sha256:{{ stratum_sha256[stratum_arch] }}"
+    mode: "0755"
+    timeout: 120
+  delegate_to: localhost
+  become: false
+  throttle: 1
+  when: stratum_binary_local_path | length == 0
+
+- name: Check the local binary's sha256
+  ansible.builtin.stat:
+    path: "{{ stratum_controller_file }}"
+    checksum_algorithm: sha256
+  delegate_to: localhost
+  become: false
+  register: stratum_local_file
+  when: stratum_binary_local_path | length > 0
+
+- name: The local binary must match the release checksum
+  ansible.builtin.assert:
+    that: stratum_local_file.stat.checksum == stratum_sha256[stratum_arch]
+    fail_msg: "{{ stratum_controller_file }} does not match the {{ stratum_version }} sha256"
+    quiet: true
+  when: stratum_binary_local_path | length > 0
+
+- name: Verify the signature
+  when: stratum_verify_signature | bool
+  delegate_to: localhost
+  become: false
+  block:
+    - name: Download the signature and certificate
+      ansible.builtin.get_url:
+        url: "{{ stratum_release_url }}/{{ stratum_version }}/stratum-linux-{{ stratum_arch }}.{{ item }}"
+        dest: "{{ stratum_controller_file }}.{{ item }}"
+        mode: "0644"
+      loop: [sig, pem]
+
+    - name: Cosign verify-blob
+      ansible.builtin.command: >-
+        cosign verify-blob
+        --certificate {{ stratum_controller_file }}.pem
+        --signature {{ stratum_controller_file }}.sig
+        --certificate-identity {{ stratum_signature_identity }}
+        --certificate-oidc-issuer {{ stratum_signature_issuer }}
+        {{ stratum_controller_file }}
+      changed_when: false
